@@ -9,12 +9,12 @@ from google import genai
 from google.genai import types
 
 st.set_page_config(
-    page_title="Alfa Learning Helper - Arshaka",
+    page_title="Alfa Learning Helper - By Arshaka",
     page_icon="🎯",
     layout="centered"
 )
 
-# Custom CSS untuk tampilan mobile-friendly
+# Custom CSS untuk tampilan mobile-friendly + Watermark Arshaka
 st.markdown("""
 <style>
     .main-header {
@@ -24,9 +24,20 @@ st.markdown("""
         color: white;
         text-align: center;
         margin-bottom: 18px;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.12);
     }
     .main-header h2 { margin: 0; font-size: 1.4rem; }
-    .main-header p { margin: 4px 0 0 0; font-size: 0.85rem; opacity: 0.9; }
+    .main-header p { margin: 4px 0 0 0; font-size: 0.85rem; opacity: 0.92; }
+    .wm-tag {
+        display: inline-block;
+        background: rgba(255,255,255,0.2);
+        padding: 3px 12px;
+        border-radius: 20px;
+        font-size: 0.75rem;
+        font-weight: 700;
+        letter-spacing: 0.5px;
+        margin-top: 8px;
+    }
     .ans-card {
         background-color: #f8f9fa;
         border-left: 5px solid #1565c0;
@@ -47,20 +58,44 @@ st.markdown("""
     }
     .ans-q { font-size: 0.9rem; color: #333; margin-bottom: 6px; }
     .ans-a { font-size: 1rem; font-weight: 700; color: #1b5e20; }
+    .footer-wm {
+        text-align: center;
+        color: #777;
+        font-size: 0.78rem;
+        margin-top: 32px;
+        padding-top: 12px;
+        border-top: 1px solid #e0e0e0;
+    }
+    .floating-wm {
+        position: fixed;
+        bottom: 10px;
+        right: 12px;
+        background: rgba(21, 101, 192, 0.88);
+        color: #ffffff;
+        padding: 4px 10px;
+        border-radius: 8px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        z-index: 9999;
+        pointer-events: none;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+    }
 </style>
+<div class="floating-wm">⚡ By Arshaka</div>
 """, unsafe_allow_html=True)
 
 st.markdown("""
 <div class="main-header">
     <h2>🎯 Alfa Learning Quiz Helper</h2>
     <p>Database 17.438 Soal • Pencarian Teks Instan & Scan Screenshot</p>
+    <div class="wm-tag">Created by Arshaka</div>
 </div>
 """, unsafe_allow_html=True)
 
 def norm(t):
     t = str(t).lower()
-    t = re.sub(r'[_*`.,?!:;()\[\]"']', ' ', t)
-    t = re.sub(r'\s+', ' ', t).strip()
+    t = re.sub(r"[^a-z0-9\s]", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
     return t
 
 @st.cache_resource
@@ -99,7 +134,6 @@ def search_database(query_text, top_k=5):
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
-# Sidebar pengaturan API Key untuk fitur scan screenshot
 with st.sidebar:
     st.header("⚙️ Pengaturan Scan Gambar")
     default_key = os.environ.get("GEMINI_API_KEY", "")
@@ -110,6 +144,8 @@ with st.sidebar:
         help="Dapatkan gratis di aistudio.google.com. Bisa juga diset di Streamlit Secrets dengan nama GEMINI_API_KEY."
     )
     st.caption(f"Total Bank Soal Aktif: **{len(bank_soal):,}** soal unik.")
+    st.divider()
+    st.caption("© 2026 **Arshaka** • Alfa Learning Helper")
 
 tab_img, tab_txt = st.tabs(["📸 Scan Screenshot Soal", "🔍 Cari Teks Soal (Offline)"])
 
@@ -130,7 +166,6 @@ with tab_img:
                         client = genai.Client(api_key=api_key)
                         images = [Image.open(f) for f in uploaded_files]
                         
-                        # Tahap 1: Ekstrak daftar soal & opsi dari gambar
                         extract_prompt = """
                         Ekstrak seluruh soal ujian yang terlihat pada gambar-gambar ini secara berurutan dari nomor soal terkecil hingga terbesar.
                         Kembalikan HANYA JSON array murni tanpa markdown, dengan format:
@@ -147,7 +182,6 @@ with tab_img:
                         extracted_items = json.loads(resp_ext.text)
                         extracted_items.sort(key=lambda x: int(x.get("no", 0)))
                         
-                        # Tahap 2: Cari referensi dari database 17.438 soal untuk setiap item
                         context_lines = []
                         for it in extracted_items:
                             no_q = it.get("no")
@@ -159,7 +193,6 @@ with tab_img:
                                 f"Nomor {no_q}:\nSoal di layar: {q_text}\nOpsi di layar: {opts}\nReferensi Bank Soal: {ref_str if ref_str else 'Tidak ada kecocokan persis'}"
                             )
                         
-                        # Tahap 3: Finalisasi jawaban sesuai opsi di layar
                         final_prompt = f"""
                         Kamu adalah asisten kunci jawaban Alfa Learning.
                         Berdasarkan Referensi Bank Soal di bawah ini, tentukan jawaban yang paling benar untuk setiap nomor soal sesuai opsi yang tersedia di layar.
@@ -199,3 +232,9 @@ with tab_txt:
                     <div class="ans-a">✅ {item['a']}</div>
                 </div>
                 """, unsafe_allow_html=True)
+
+st.markdown("""
+<div class="footer-wm">
+    Aplikasi Kunci Jawaban Alfa Learning • Dibuat oleh <b>Arshaka</b>
+</div>
+""", unsafe_allow_html=True)
