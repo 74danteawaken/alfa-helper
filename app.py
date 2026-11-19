@@ -2,7 +2,6 @@ import gzip
 import json
 import os
 import re
-import time
 from difflib import SequenceMatcher
 import streamlit as st
 from PIL import Image
@@ -104,6 +103,7 @@ def load_bank_soal():
         data = json.load(f)
     for item in data:
         item["qn"] = norm(item["q"])
+        item["an"] = norm(item["a"])
     return data
 
 bank_soal = load_bank_soal()
@@ -134,39 +134,50 @@ def search_database(query_text, top_k=5):
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
-def generate_with_fallback(client, contents, config=None):
-    candidate_models = [
-        "gemini-3.8-flash-lite",
+def match_best_option(bank_answer, screen_options):
+    if not screen_options:
+        return bank_answer
+    ba = norm(bank_answer)
+    best_opt = None
+    best_sc = 0.0
+    for opt in screen_options:
+        on = norm(opt)
+        if ba == on or ba in on or on in ba:
+            return opt
+        sc = SequenceMatcher(None, ba, on).ratio()
+        if sc > best_sc:
+            best_sc = sc
+            best_opt = opt
+    return best_opt if best_sc >= 0.55 else f"{bank_answer} *(kunci bank soal)*"
+
+def optimize_image(file_obj, max_width=1024):
+    img = Image.open(file_obj).convert("RGB")
+    if img.width > max_width:
+        ratio = max_width / float(img.width)
+        new_h = int(float(img.height) * ratio)
+        img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
+    return img
+
+def fast_generate(client, contents, config):
+    # Prioritaskan model cepat tanpa delay retry lama
+    models_to_try = [
         "gemini-2.5-flash-lite",
+        "gemini-3.8-flash-lite",
         "gemini-3.8-flash",
         "gemini-3.0-flash",
         "gemini-2.0-flash"
     ]
-    try:
-        for m in client.models.list():
-            m_name = getattr(m, "name", "").replace("models/", "")
-            if "flash" in m_name and "image" not in m_name and "audio" not in m_name and m_name not in candidate_models:
-                candidate_models.append(m_name)
-    except Exception:
-        pass
-
     last_err = None
-    for model_name in candidate_models:
-        for attempt in range(2):
-            try:
-                return client.models.generate_content(
-                    model=model_name,
-                    contents=contents,
-                    config=config
-                ), model_name
-            except Exception as e:
-                last_err = e
-                err_str = str(e)
-                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
-                    time.sleep(2)
-                    continue
-                else:
-                    break
+    for m in models_to_try:
+        try:
+            return client.models.generate_content(
+                model=m,
+                contents=contents,
+                config=config
+            ), m
+        except Exception as e:
+            last_err = e
+            continue
     raise last_err
 
 with st.sidebar:
@@ -176,7 +187,7 @@ with st.sidebar:
         "Gemini API Key (Opsional untuk Scan Screenshot)",
         value=default_key,
         type="password",
-        help="Dapatkan gratis di aistudio.google.com. Bisa juga diset di Streamlit Secrets dengan nama GEMINI_API_KEY."
+        help="Diset di Streamlit Secrets dengan nama GEMINI_API_KEY."
     )
     st.caption(f"Total Bank Soal Aktif: **{len(bank_soal):,}** soal unik.")
     st.divider()
@@ -194,70 +205,52 @@ with tab_img:
     if uploaded_files:
         if st.button("🚀 Jawab Semua Soal di Gambar", type="primary", use_container_width=True):
             if not api_key:
-                st.error("Masukkan **Gemini API Key** terlebih dahulu di menu sebelah kiri (sidebar) untuk mengaktifkan fitur baca screenshot.")
+                st.error("Masukkan **Gemini API Key** terlebih dahulu di menu sebelah kiri (sidebar).")
             else:
-                with st.spinner("Membaca screenshot dan mencocokkan dengan 17.438 bank soal..."):
+                with st.spinner("Memindai gambar secara cepat..."):
                     try:
                         client = genai.Client(api_key=api_key)
-                        images = [Image.open(f) for f in uploaded_files]
+                        images = [optimize_image(f) for f in uploaded_files]
 
-                        extract_prompt = """
-                        Ekstrak seluruh soal ujian yang terlihat pada gambar-gambar ini secara berurutan dari nomor soal terkecil hingga terbesar.
-                        Kembalikan HANYA JSON array murni tanpa markdown, dengan format:
-                        [{"no": 1, "soal": "teks pertanyaan lengkap", "opsi": ["opsi A", "opsi B"]}]
+                        prompt = """
+                        Baca semua soal pilihan ganda pada gambar ini secara berurutan dari nomor terkecil ke terbesar.
+                        Kembalikan HANYA JSON array tanpa teks tambahan:
+                        [{"no": 1, "soal": "teks soal", "opsi": ["opsi 1", "opsi 2"], "tebakan_ai": "opsi paling benar jika tidak ada di database"}]
                         """
-                        resp_ext, used_model = generate_with_fallback(
+                        resp, used_model = fast_generate(
                             client,
-                            [extract_prompt, *images],
+                            [prompt, *images],
                             types.GenerateContentConfig(
                                 response_mime_type="application/json",
-                                temperature=0.1
+                                temperature=0.0
                             )
                         )
-                        extracted_items = json.loads(resp_ext.text)
-                        extracted_items.sort(key=lambda x: int(x.get("no", 0)))
+                        items = json.loads(resp.text)
+                        items.sort(key=lambda x: int(x.get("no", 0)))
 
-                        output_lines = []
-                        need_ai_choice = []
-
-                        for it in extracted_items:
-                            no_q = it.get("no")
+                        st.success(f"Selesai dalam 1 langkah! (`{used_model}`)")
+                        for it in items:
+                            no_q = it.get("no", "-")
                             q_text = it.get("soal", "")
                             opts = it.get("opsi", [])
-                            matches = search_database(q_text, top_k=3)
-                            if matches and matches[0][0] >= 0.85 and not opts:
-                                output_lines.append((int(no_q), f"{no_q}. **{matches[0][1]['a']}** *(Bank Soal {int(matches[0][0]*100)}%)*"))
-                            else:
-                                ref_str = " | ".join([f"[Cocok {int(sc*100)}%] Q: {m['q']} => A: {m['a']}" for sc, m in matches])
-                                need_ai_choice.append(
-                                    f"Nomor {no_q}:\nSoal: {q_text}\nOpsi di layar: {opts}\nReferensi Bank Soal: {ref_str if ref_str else 'Tidak ada'}"
-                                )
+                            ai_guess = it.get("tebakan_ai", "")
 
-                        if need_ai_choice:
-                            final_prompt = f"""
-                            Kamu adalah asisten kunci jawaban Alfa Learning.
-                            Berdasarkan Referensi Bank Soal di bawah ini, pilih jawaban yang paling tepat dari Opsi di layar untuk setiap nomor soal.
-                            
-                            Aturan format keluaran:
-                            - Langsung tampilkan daftar nomor urut dari terkecil ke terbesar.
-                            - Format per baris: `1. **Teks Opsi Jawaban Benar**`
-                            - Jika kunci jawaban di bank soal berlawanan dengan logika umum (soal jebakan), tambahkan catatan singkat dalam kurung di samping jawaban.
-                            - Jangan tulis kata pengantar atau penutup.
-                            
-                            Data Soal & Referensi:
-                            {chr(10).join(need_ai_choice)}
-                            """
-                            resp_final, used_model = generate_with_fallback(
-                                client,
-                                final_prompt,
-                                types.GenerateContentConfig(temperature=0.1)
-                            )
-                            st.success(f"Selesai! (Mesin aktif: `{used_model}`)")
-                            st.markdown(resp_final.text)
-                        else:
-                            output_lines.sort(key=lambda x: x[0])
-                            st.success(f"Selesai! (Mesin aktif: `{used_model}`)")
-                            st.markdown("\n".join([x[1] for x in output_lines]))
+                            matches = search_database(q_text, top_k=1)
+                            if matches and matches[0][0] >= 0.55:
+                                sc, db_item = matches[0]
+                                final_ans = match_best_option(db_item["a"], opts)
+                                badge = f"Database {int(sc*100)}%"
+                            else:
+                                final_ans = ai_guess if ai_guess else "Tidak ditemukan di bank soal"
+                                badge = "Analisis AI"
+
+                            st.markdown(f"""
+                            <div class="ans-card">
+                                <span class="ans-badge">No. {no_q} • {badge}</span>
+                                <div class="ans-q">{q_text}</div>
+                                <div class="ans-a">✅ {final_ans}</div>
+                            </div>
+                            """, unsafe_allow_html=True)
                     except Exception as e:
                         st.error(f"Terjadi kesalahan: {e}")
 
