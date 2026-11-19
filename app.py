@@ -1,13 +1,11 @@
 import gzip
 import json
-import os
 import re
-import time
 from difflib import SequenceMatcher
+import numpy as np
 import streamlit as st
 from PIL import Image
-from google import genai
-from google.genai import types
+from rapidocr_onnxruntime import RapidOCR
 
 st.set_page_config(
     page_title="Alfa Learning Helper - By Arshaka",
@@ -87,7 +85,7 @@ st.markdown("""
 st.markdown("""
 <div class="main-header">
     <h2>🎯 Alfa Learning Quiz Helper</h2>
-    <p>Database 17.438 Soal • Pencarian Teks Instan & Scan Screenshot</p>
+    <p>Database 17.438 Soal • Pencarian Teks & Scan Screenshot Unlimited</p>
     <div class="wm-tag">Created by Arshaka</div>
 </div>
 """, unsafe_allow_html=True)
@@ -104,10 +102,14 @@ def load_bank_soal():
         data = json.load(f)
     for item in data:
         item["qn"] = norm(item["q"])
-        item["an"] = norm(item["a"])
     return data
 
+@st.cache_resource
+def load_ocr():
+    return RapidOCR()
+
 bank_soal = load_bank_soal()
+ocr_engine = load_ocr()
 
 def search_database(query_text, top_k=5):
     qn = norm(query_text)
@@ -126,115 +128,40 @@ def search_database(query_text, top_k=5):
             if hits == 0:
                 continue
             token_ratio = hits / len(tokens)
-            if token_ratio < 0.45:
+            if token_ratio < 0.40:
                 continue
             seq_ratio = SequenceMatcher(None, qn[:140], target[:140]).ratio()
-            score = (token_ratio * 0.6) + (seq_ratio * 0.4)
-            if score >= 0.50:
+            score = (token_ratio * 0.65) + (seq_ratio * 0.35)
+            if score >= 0.48:
                 scored.append((score, item))
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
-def match_best_option(bank_answer, screen_options):
-    if not screen_options:
-        return bank_answer
-    ba = norm(bank_answer)
-    best_opt = None
-    best_sc = 0.0
-    for opt in screen_options:
-        on = norm(opt)
-        if ba == on or ba in on or on in ba:
-            return opt
-        sc = SequenceMatcher(None, ba, on).ratio()
-        if sc > best_sc:
-            best_sc = sc
-            best_opt = opt
-    return best_opt if best_sc >= 0.55 else f"{bank_answer} *(kunci bank soal)*"
+def extract_questions_from_ocr(lines):
+    full_text = "\n".join(lines)
+    # Pisahkan berdasarkan nomor soal (misal: "1.", "12.", "Soal 1", dsb.)
+    blocks = re.split(r'(?:^|\n)\s*(?:soal\s*)?(\d{1,2})\s*[\.\)]\s+', full_text, flags=re.IGNORECASE)
+    questions = []
+    if len(blocks) >= 3:
+        for i in range(1, len(blocks) - 1, 2):
+            no_q = blocks[i]
+            body = blocks[i + 1].strip()
+            # Ambil bagian pertanyaan sebelum opsi a./b./bulatan
+            q_part = re.split(r'\n\s*(?:[a-eA-E][\.\)]|[oO0•\-])\s+', body)[0]
+            q_clean = re.sub(r'\s+', ' ', q_part).strip()
+            if len(q_clean) >= 8:
+                questions.append((int(no_q), q_clean))
+    if not questions:
+        # Fallback: gabungkan seluruh baris teks jika nomor soal terpotong di screenshot
+        joined = re.sub(r'\s+', ' ', full_text).strip()
+        if joined:
+            questions.append((1, joined))
+    return questions
 
-def optimize_image(file_obj, max_width=900):
-    img = Image.open(file_obj).convert("RGB")
-    if img.width > max_width:
-        ratio = max_width / float(img.width)
-        new_h = int(float(img.height) * ratio)
-        img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
-    return img
-
-@st.cache_data(ttl=3600)
-def get_available_models(key):
-    client = genai.Client(api_key=key)
-    preferred = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash"]
-    found = []
-    try:
-        for m in client.models.list():
-            name = getattr(m, "name", "").replace("models/", "")
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods and "gemini" in name:
-                if not any(x in name for x in ["image", "audio", "tts", "embedding", "2.0", "2.5", "1.5", "pro"]):
-                    found.append(name)
-    except Exception:
-        pass
-    ordered = [p for p in preferred if p in found] + [f for f in found if f not in preferred]
-    return ordered if ordered else ["gemini-3.8-flash"]
-
-def fast_generate(api_key, contents):
-    client = genai.Client(api_key=api_key)
-    models_to_try = get_available_models(api_key)
-    last_err = None
-
-    for m in models_to_try:
-        for attempt in range(2):
-            try:
-                config = types.GenerateContentConfig(
-                    response_mime_type="application/json",
-                    temperature=0.0,
-                    thinking_config=types.ThinkingConfig(thinking_budget=0)
-                )
-                return client.models.generate_content(
-                    model=m,
-                    contents=contents,
-                    config=config
-                ), m
-            except Exception as e:
-                err_msg = str(e)
-                if "thinking" in err_msg.lower():
-                    try:
-                        return client.models.generate_content(
-                            model=m,
-                            contents=contents,
-                            config=types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                temperature=0.0
-                            )
-                        ), m
-                    except Exception as e2:
-                        last_err = e2
-                        err_msg = str(e2)
-                else:
-                    last_err = e
-
-                if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg:
-                    time.sleep(1.5)
-                    continue
-                break
-    raise last_err
-
-with st.sidebar:
-    st.header("⚙️ Pengaturan Scan Gambar")
-    default_key = os.environ.get("GEMINI_API_KEY", "")
-    api_key = st.text_input(
-        "Gemini API Key (Opsional untuk Scan Screenshot)",
-        value=default_key,
-        type="password",
-        help="Diset di Streamlit Secrets dengan nama GEMINI_API_KEY."
-    )
-    st.caption(f"Total Bank Soal Aktif: **{len(bank_soal):,}** soal unik.")
-    st.divider()
-    st.caption("© 2026 **Arshaka** • Alfa Learning Helper")
-
-tab_img, tab_txt = st.tabs(["📸 Scan Screenshot Soal", "🔍 Cari Teks Soal (Offline)"])
+tab_img, tab_txt = st.tabs(["📸 Scan Screenshot Soal (Unlimited)", "🔍 Cari Teks Soal"])
 
 with tab_img:
-    st.write("Unggah satu atau beberapa screenshot soal ujian sekaligus:")
+    st.write("Unggah satu atau beberapa screenshot soal ujian sekaligus (tanpa batas kuota):")
     uploaded_files = st.file_uploader(
         "Pilih Gambar Screenshot",
         type=["png", "jpg", "jpeg", "webp"],
@@ -242,50 +169,45 @@ with tab_img:
     )
     if uploaded_files:
         if st.button("🚀 Jawab Semua Soal di Gambar", type="primary", use_container_width=True):
-            if not api_key:
-                st.error("Masukkan **Gemini API Key** terlebih dahulu di menu sebelah kiri (sidebar).")
-            else:
-                with st.spinner("Memindai gambar secara cepat..."):
-                    try:
-                        images = [optimize_image(f) for f in uploaded_files]
+            with st.spinner("Membaca teks screenshot & mencocokkan database..."):
+                all_extracted = []
+                for f in uploaded_files:
+                    img = Image.open(f).convert("RGB")
+                    if img.width > 1000:
+                        ratio = 1000 / float(img.width)
+                        img = img.resize((1000, int(img.height * ratio)), Image.Resampling.LANCZOS)
+                    result, _ = ocr_engine(np.array(img))
+                    if result:
+                        lines = [item[1] for item in result]
+                        all_extracted.extend(extract_questions_from_ocr(lines))
 
-                        prompt = """
-                        Baca semua soal pilihan ganda pada gambar ini secara berurutan dari nomor terkecil ke terbesar.
-                        Kembalikan HANYA JSON array tanpa teks tambahan:
-                        [{"no": 1, "soal": "teks soal", "opsi": ["opsi 1", "opsi 2"], "tebakan_ai": "opsi paling benar jika tidak ada di database"}]
-                        """
-                        resp, used_model = fast_generate(api_key, [prompt, *images])
-                        items = json.loads(resp.text)
-                        items.sort(key=lambda x: int(x.get("no", 0)))
-
-                        st.success(f"Selesai! (`{used_model}`)")
-                        for it in items:
-                            no_q = it.get("no", "-")
-                            q_text = it.get("soal", "")
-                            opts = it.get("opsi", [])
-                            ai_guess = it.get("tebakan_ai", "")
-
-                            matches = search_database(q_text, top_k=1)
-                            if matches and matches[0][0] >= 0.55:
-                                sc, db_item = matches[0]
-                                final_ans = match_best_option(db_item["a"], opts)
-                                badge = f"Database {int(sc*100)}%"
-                            else:
-                                final_ans = ai_guess if ai_guess else "Tidak ditemukan di bank soal"
-                                badge = "Analisis AI"
-
+                if not all_extracted:
+                    st.warning("Teks pada gambar tidak terbaca. Pastikan gambar tidak terlalu buram.")
+                else:
+                    all_extracted.sort(key=lambda x: x[0])
+                    st.success(f"Ditemukan {len(all_extracted)} soal dari screenshot!")
+                    for no_q, q_text in all_extracted:
+                        matches = search_database(q_text, top_k=1)
+                        if matches:
+                            sc, db_item = matches[0]
                             st.markdown(f"""
                             <div class="ans-card">
-                                <span class="ans-badge">No. {no_q} • {badge}</span>
-                                <div class="ans-q">{q_text}</div>
-                                <div class="ans-a">✅ {final_ans}</div>
+                                <span class="ans-badge">No. {no_q} • Kemiripan {int(sc*100)}% ({db_item['m']})</span>
+                                <div class="ans-q">{db_item['q']}</div>
+                                <div class="ans-a">✅ {db_item['a']}</div>
                             </div>
                             """, unsafe_allow_html=True)
-                    except Exception as e:
-                        st.error(f"Terjadi kesalahan: {e}")
+                        else:
+                            st.markdown(f"""
+                            <div class="ans-card">
+                                <span class="ans-badge">No. {no_q} • Tidak Cocok</span>
+                                <div class="ans-q">{q_text}</div>
+                                <div class="ans-a">⚠️ Tidak ditemukan di bank soal, coba cari kata kuncinya di tab sebelah.</div>
+                            </div>
+                            """, unsafe_allow_html=True)
 
 with tab_txt:
-    query = st.text_input("Ketik potongan kalimat soal (tanpa perlu API Key):", placeholder="Contoh: kategori beban toko / Close Supervisi / Odner 4")
+    query = st.text_input("Ketik potongan kalimat soal:", placeholder="Contoh: kategori beban toko / Close Supervisi / Odner 4")
     if query:
         results = search_database(query, top_k=8)
         if not results:
