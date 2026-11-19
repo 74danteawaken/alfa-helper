@@ -102,7 +102,7 @@ def load_bank_soal():
         data = json.load(f)
     for item in data:
         item["qn"] = norm(item["q"])
-        item["qn_nospace"] = item["qn"].replace(" ", "")
+        item["qn_ns"] = item["qn"].replace(" ", "")
     return data
 
 @st.cache_resource
@@ -121,10 +121,9 @@ def search_database(query_text, top_k=5):
     scored = []
     for item in bank_soal:
         target = item["qn"]
-        target_ns = item["qn_nospace"]
+        target_ns = item["qn_ns"]
         if qn in target or (len(qn_ns) >= 12 and qn_ns in target_ns):
-            score = 0.96
-            scored.append((score, item))
+            scored.append((0.96, item))
             continue
         if tokens:
             hits = sum(1 for tok in tokens if tok in target)
@@ -135,7 +134,6 @@ def search_database(query_text, top_k=5):
                 if score >= 0.45:
                     scored.append((score, item))
                     continue
-        # Fallback jika OCR menggabungkan kata tanpa spasi
         if len(qn_ns) >= 12:
             seq_ns = SequenceMatcher(None, qn_ns[:120], target_ns[:120]).ratio()
             if seq_ns >= 0.58:
@@ -144,52 +142,32 @@ def search_database(query_text, top_k=5):
     return scored[:top_k]
 
 def extract_alfa_questions(ocr_result):
-    # Urutkan box berdasarkan posisi Y (atas ke bawah) lalu X (kiri ke kanan)
     sorted_boxes = sorted(ocr_result, key=lambda b: (round(b[0][0][1] / 12), b[0][0][0]))
     lines = [b[1].strip() for b in sorted_boxes if b[1].strip()]
     full_text = "\n".join(lines)
-
-    # Pisahkan per "Question 1", "Question 2", atau variasi OCR seperti "Jestion1", "uestion 2"
     parts = re.split(r'(?:question|jestion|uestion|estion)\s*(\d{1,2})\b', full_text, flags=re.IGNORECASE)
     extracted = []
-
+    cut_pattern = r'(?:not\s*yet|otyetswered|marked\s*out|arkedout|select\s*one|selectone|flag\s*question|flagquestion)'
     if len(parts) >= 3:
         for i in range(1, len(parts) - 1, 2):
             no_q = int(parts[i])
             block = parts[i + 1]
-            # Potong bagian UI Moodle ("Not yet answered", "Marked out of", "Select one:", "Flag question")
-            q_only = re.split(
-                r'(?:not\s*yet|otyetswered|marked\s*out|arkedout|select\s*one|selectone|flag\s*question|flagquestion)',
-                block,
-                maxsplit=1,
-                flags=re.IGNORECASE
-            )[0]
+            q_only = re.split(cut_pattern, block, maxsplit=1, flags=re.IGNORECASE)[0]
             q_clean = re.sub(r'\s+', ' ', q_only).strip(" :.-")
             if len(q_clean) >= 6:
                 extracted.append((no_q, q_clean))
     else:
-        # Fallback jika kata "Question" terpotong di screenshot
-        q_only = re.split(
-            r'(?:not\s*yet|otyetswered|marked\s*out|arkedout|select\s*one|selectone|flag\s*question|flagquestion)',
-            full_text,
-            maxsplit=1,
-            flags=re.IGNORECASE
-        )[0]
+        q_only = re.split(cut_pattern, full_text, maxsplit=1, flags=re.IGNORECASE)[0]
         q_clean = re.sub(r'\s+', ' ', q_only).strip()
         if q_clean:
             extracted.append((1, q_clean))
-
     return extracted
 
 tab_img, tab_txt = st.tabs(["📸 Scan Screenshot Soal (Unlimited)", "🔍 Cari Teks Soal"])
 
 with tab_img:
     st.write("Unggah satu atau beberapa screenshot soal ujian sekaligus (tanpa batas kuota):")
-    uploaded_files = st.file_uploader(
-        "Pilih Gambar Screenshot",
-        type=["png", "jpg", "jpeg", "webp"],
-        accept_multiple_files=True
-    )
+    uploaded_files = st.file_uploader("Pilih Gambar Screenshot", type=["png", "jpg", "jpeg", "webp"], accept_multiple_files=True)
     if uploaded_files:
         if st.button("🚀 Jawab Semua Soal di Gambar", type="primary", use_container_width=True):
             with st.spinner("Membaca soal & mencocokkan dengan 17.438 database..."):
@@ -199,35 +177,32 @@ with tab_img:
                     result, _ = ocr_engine(np.array(img))
                     if result:
                         all_extracted.extend(extract_alfa_questions(result))
-
                 if not all_extracted:
-                    st.warning("Teks soal tidak terdeteksi. Pastikan bagian pertanyaan terlihat di screenshot.")
+                    st.warning("Teks soal tidak terdeteksi.")
                 else:
-                    # Hapus duplikat nomor soal yang sama jika terpotong di 2 screenshot
                     dedup = {}
                     for no_q, q_txt in all_extracted:
                         if no_q not in dedup or len(q_txt) > len(dedup[no_q]):
                             dedup[no_q] = q_txt
-
                     sorted_qs = sorted(dedup.items(), key=lambda x: x[0])
                     st.success(f"Ditemukan {len(sorted_qs)} soal dari screenshot!")
-
                     for no_q, q_text in sorted_qs:
                         matches = search_database(q_text, top_k=1)
                         if matches:
                             sc, db_item = matches[0]
-                            st.markdown(f"""
-                            <div class="ans-card">
-                                <span class="ans-badge">Question {no_q} • Cocok {int(sc*100)}% ({db_item['m']})</span>
-                                <div class="ans-q">{db_item['q']}</div>
-                                <div class="ans-a">✅ {db_item['a']}</div>
-                            </div>
-                            """, unsafe_allow_html=True)
+                            st.markdown(f'<div class="ans-card"><span class="ans-badge">Question {no_q} • Cocok {int(sc*100)}% ({db_item["m"]})</span><div class="ans-q">{db_item["q"]}</div><div class="ans-a">✅ {db_item["a"]}</div></div>', unsafe_allow_html=True)
                         else:
-                            st.markdown(f"""
-                            <div class="ans-card">
-                                <span class="ans-badge">Question {no_q} • Tidak Ditemukan</span>
-                                <div class="ans-q">{q_text}</div>
-                                <div class="ans-a">⚠️ Tidak ada di database, coba cari kata kuncinya di tab sebelah.</div>
-                            </div>
-                            """, unsafe_allow
+                            st.markdown(f'<div class="ans-card"><span class="ans-badge">Question {no_q} • Tidak Ditemukan</span><div class="ans-q">{q_text}</div><div class="ans-a">⚠️ Tidak ada di database.</div></div>', unsafe_allow_html=True)
+
+with tab_txt:
+    query = st.text_input("Ketik potongan kalimat soal:", placeholder="Contoh: kategori beban toko / Close Supervisi / Odner 4")
+    if query:
+        results = search_database(query, top_k=8)
+        if not results:
+            st.warning("Soal tidak ditemukan.")
+        else:
+            for score, item in results:
+                pct = int(score * 100)
+                st.markdown(f'<div class="ans-card"><span class="ans-badge">{item["m"]} • Kemiripan {pct}%</span><div class="ans-q">{item["q"]}</div><div class="ans-a">✅ {item["a"]}</div></div>', unsafe_allow_html=True)
+
+st.markdown('<div class="footer-wm">Aplikasi Kunci Jawaban Alfa Learning • Dibuat oleh <b>Arshaka</b></div>', unsafe_allow_html=True)
