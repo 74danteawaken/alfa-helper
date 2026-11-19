@@ -172,7 +172,7 @@ with tab_img:
                         [{"no": 1, "soal": "teks pertanyaan lengkap", "opsi": ["opsi A", "opsi B"]}]
                         """
                         resp_ext = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-3.8-flash",
                             contents=[extract_prompt, *images],
                             config=types.GenerateContentConfig(
                                 response_mime_type="application/json",
@@ -207,7 +207,7 @@ with tab_img:
                         {chr(10).join(context_lines)}
                         """
                         resp_final = client.models.generate_content(
-                            model="gemini-2.5-flash",
+                            model="gemini-3.8-flash",
                             contents=final_prompt,
                             config=types.GenerateContentConfig(temperature=0.1)
                         )
