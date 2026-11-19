@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 import re
+import time
 from difflib import SequenceMatcher
 import streamlit as st
 from PIL import Image
@@ -14,7 +15,6 @@ st.set_page_config(
     layout="centered"
 )
 
-# Custom CSS untuk tampilan mobile-friendly + Watermark Arshaka
 st.markdown("""
 <style>
     .main-header {
@@ -134,6 +134,41 @@ def search_database(query_text, top_k=5):
     scored.sort(key=lambda x: x[0], reverse=True)
     return scored[:top_k]
 
+def generate_with_fallback(client, contents, config=None):
+    candidate_models = [
+        "gemini-3.8-flash-lite",
+        "gemini-2.5-flash-lite",
+        "gemini-3.8-flash",
+        "gemini-3.0-flash",
+        "gemini-2.0-flash"
+    ]
+    try:
+        for m in client.models.list():
+            m_name = getattr(m, "name", "").replace("models/", "")
+            if "flash" in m_name and "image" not in m_name and "audio" not in m_name and m_name not in candidate_models:
+                candidate_models.append(m_name)
+    except Exception:
+        pass
+
+    last_err = None
+    for model_name in candidate_models:
+        for attempt in range(2):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config
+                ), model_name
+            except Exception as e:
+                last_err = e
+                err_str = str(e)
+                if "503" in err_str or "UNAVAILABLE" in err_str or "429" in err_str:
+                    time.sleep(2)
+                    continue
+                else:
+                    break
+    raise last_err
+
 with st.sidebar:
     st.header("⚙️ Pengaturan Scan Gambar")
     default_key = os.environ.get("GEMINI_API_KEY", "")
@@ -165,54 +200,64 @@ with tab_img:
                     try:
                         client = genai.Client(api_key=api_key)
                         images = [Image.open(f) for f in uploaded_files]
-                        
+
                         extract_prompt = """
                         Ekstrak seluruh soal ujian yang terlihat pada gambar-gambar ini secara berurutan dari nomor soal terkecil hingga terbesar.
                         Kembalikan HANYA JSON array murni tanpa markdown, dengan format:
                         [{"no": 1, "soal": "teks pertanyaan lengkap", "opsi": ["opsi A", "opsi B"]}]
                         """
-                        resp_ext = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=[extract_prompt, *images],
-                            config=types.GenerateContentConfig(
+                        resp_ext, used_model = generate_with_fallback(
+                            client,
+                            [extract_prompt, *images],
+                            types.GenerateContentConfig(
                                 response_mime_type="application/json",
                                 temperature=0.1
                             )
                         )
                         extracted_items = json.loads(resp_ext.text)
                         extracted_items.sort(key=lambda x: int(x.get("no", 0)))
-                        
-                        context_lines = []
+
+                        output_lines = []
+                        need_ai_choice = []
+
                         for it in extracted_items:
                             no_q = it.get("no")
                             q_text = it.get("soal", "")
                             opts = it.get("opsi", [])
                             matches = search_database(q_text, top_k=3)
-                            ref_str = " | ".join([f"[Cocok {int(sc*100)}%] Q: {m['q']} => A: {m['a']}" for sc, m in matches])
-                            context_lines.append(
-                                f"Nomor {no_q}:\nSoal di layar: {q_text}\nOpsi di layar: {opts}\nReferensi Bank Soal: {ref_str if ref_str else 'Tidak ada kecocokan persis'}"
+                            if matches and matches[0][0] >= 0.85 and not opts:
+                                output_lines.append((int(no_q), f"{no_q}. **{matches[0][1]['a']}** *(Bank Soal {int(matches[0][0]*100)}%)*"))
+                            else:
+                                ref_str = " | ".join([f"[Cocok {int(sc*100)}%] Q: {m['q']} => A: {m['a']}" for sc, m in matches])
+                                need_ai_choice.append(
+                                    f"Nomor {no_q}:\nSoal: {q_text}\nOpsi di layar: {opts}\nReferensi Bank Soal: {ref_str if ref_str else 'Tidak ada'}"
+                                )
+
+                        if need_ai_choice:
+                            final_prompt = f"""
+                            Kamu adalah asisten kunci jawaban Alfa Learning.
+                            Berdasarkan Referensi Bank Soal di bawah ini, pilih jawaban yang paling tepat dari Opsi di layar untuk setiap nomor soal.
+                            
+                            Aturan format keluaran:
+                            - Langsung tampilkan daftar nomor urut dari terkecil ke terbesar.
+                            - Format per baris: `1. **Teks Opsi Jawaban Benar**`
+                            - Jika kunci jawaban di bank soal berlawanan dengan logika umum (soal jebakan), tambahkan catatan singkat dalam kurung di samping jawaban.
+                            - Jangan tulis kata pengantar atau penutup.
+                            
+                            Data Soal & Referensi:
+                            {chr(10).join(need_ai_choice)}
+                            """
+                            resp_final, used_model = generate_with_fallback(
+                                client,
+                                final_prompt,
+                                types.GenerateContentConfig(temperature=0.1)
                             )
-                        
-                        final_prompt = f"""
-                        Kamu adalah asisten kunci jawaban Alfa Learning.
-                        Berdasarkan Referensi Bank Soal di bawah ini, tentukan jawaban yang paling benar untuk setiap nomor soal sesuai opsi yang tersedia di layar.
-                        
-                        Aturan format keluaran:
-                        - Langsung tampilkan daftar nomor urut dari terkecil ke terbesar.
-                        - Format per baris: `1. **Teks Opsi Jawaban Benar**`
-                        - Jika kunci jawaban di bank soal berlawanan dengan logika umum (soal jebakan), tambahkan catatan singkat dalam kurung di samping jawaban.
-                        - Jangan tulis kata pengantar atau penutup.
-                        
-                        Data Soal & Referensi:
-                        {chr(10).join(context_lines)}
-                        """
-                        resp_final = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=final_prompt,
-                            config=types.GenerateContentConfig(temperature=0.1)
-                        )
-                        st.success("Selesai!")
-                        st.markdown(resp_final.text)
+                            st.success(f"Selesai! (Mesin aktif: `{used_model}`)")
+                            st.markdown(resp_final.text)
+                        else:
+                            output_lines.sort(key=lambda x: x[0])
+                            st.success(f"Selesai! (Mesin aktif: `{used_model}`)")
+                            st.markdown("\n".join([x[1] for x in output_lines]))
                     except Exception as e:
                         st.error(f"Terjadi kesalahan: {e}")
 
