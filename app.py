@@ -2,6 +2,7 @@ import gzip
 import json
 import os
 import re
+import time
 from difflib import SequenceMatcher
 import streamlit as st
 from PIL import Image
@@ -150,7 +151,7 @@ def match_best_option(bank_answer, screen_options):
             best_opt = opt
     return best_opt if best_sc >= 0.55 else f"{bank_answer} *(kunci bank soal)*"
 
-def optimize_image(file_obj, max_width=1024):
+def optimize_image(file_obj, max_width=900):
     img = Image.open(file_obj).convert("RGB")
     if img.width > max_width:
         ratio = max_width / float(img.width)
@@ -158,26 +159,63 @@ def optimize_image(file_obj, max_width=1024):
         img = img.resize((max_width, new_h), Image.Resampling.LANCZOS)
     return img
 
-def fast_generate(client, contents, config):
-    # Prioritaskan model cepat tanpa delay retry lama
-    models_to_try = [
-        "gemini-2.5-flash-lite",
-        "gemini-3.8-flash-lite",
-        "gemini-3.8-flash",
-        "gemini-3.0-flash",
-        "gemini-2.0-flash"
-    ]
+@st.cache_data(ttl=3600)
+def get_available_models(key):
+    client = genai.Client(api_key=key)
+    preferred = ["gemini-3.8-flash-lite", "gemini-3.8-flash", "gemini-3.5-flash", "gemini-3.0-flash"]
+    found = []
+    try:
+        for m in client.models.list():
+            name = getattr(m, "name", "").replace("models/", "")
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" in methods and "gemini" in name:
+                if not any(x in name for x in ["image", "audio", "tts", "embedding", "2.0", "2.5", "1.5", "pro"]):
+                    found.append(name)
+    except Exception:
+        pass
+    ordered = [p for p in preferred if p in found] + [f for f in found if f not in preferred]
+    return ordered if ordered else ["gemini-3.8-flash"]
+
+def fast_generate(api_key, contents):
+    client = genai.Client(api_key=api_key)
+    models_to_try = get_available_models(api_key)
     last_err = None
+
     for m in models_to_try:
-        try:
-            return client.models.generate_content(
-                model=m,
-                contents=contents,
-                config=config
-            ), m
-        except Exception as e:
-            last_err = e
-            continue
+        for attempt in range(2):
+            try:
+                config = types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    temperature=0.0,
+                    thinking_config=types.ThinkingConfig(thinking_budget=0)
+                )
+                return client.models.generate_content(
+                    model=m,
+                    contents=contents,
+                    config=config
+                ), m
+            except Exception as e:
+                err_msg = str(e)
+                if "thinking" in err_msg.lower():
+                    try:
+                        return client.models.generate_content(
+                            model=m,
+                            contents=contents,
+                            config=types.GenerateContentConfig(
+                                response_mime_type="application/json",
+                                temperature=0.0
+                            )
+                        ), m
+                    except Exception as e2:
+                        last_err = e2
+                        err_msg = str(e2)
+                else:
+                    last_err = e
+
+                if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg:
+                    time.sleep(1.5)
+                    continue
+                break
     raise last_err
 
 with st.sidebar:
@@ -209,7 +247,6 @@ with tab_img:
             else:
                 with st.spinner("Memindai gambar secara cepat..."):
                     try:
-                        client = genai.Client(api_key=api_key)
                         images = [optimize_image(f) for f in uploaded_files]
 
                         prompt = """
@@ -217,18 +254,11 @@ with tab_img:
                         Kembalikan HANYA JSON array tanpa teks tambahan:
                         [{"no": 1, "soal": "teks soal", "opsi": ["opsi 1", "opsi 2"], "tebakan_ai": "opsi paling benar jika tidak ada di database"}]
                         """
-                        resp, used_model = fast_generate(
-                            client,
-                            [prompt, *images],
-                            types.GenerateContentConfig(
-                                response_mime_type="application/json",
-                                temperature=0.0
-                            )
-                        )
+                        resp, used_model = fast_generate(api_key, [prompt, *images])
                         items = json.loads(resp.text)
                         items.sort(key=lambda x: int(x.get("no", 0)))
 
-                        st.success(f"Selesai dalam 1 langkah! (`{used_model}`)")
+                        st.success(f"Selesai! (`{used_model}`)")
                         for it in items:
                             no_q = it.get("no", "-")
                             q_text = it.get("soal", "")
